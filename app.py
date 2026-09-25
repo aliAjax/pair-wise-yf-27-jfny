@@ -22,6 +22,9 @@ CLAIM_TRANSITIONS = {
     "resolved_return": set(),
     "rejected": set(),
 }
+# 双人审查：进入协商或返还结论前，需两名不同审查员都赞成且无反对票。
+REQUIRED_APPROVALS = 2
+DUAL_REVIEW_TARGETS = {"negotiating", "resolved_return"}
 
 
 class BusinessError(Exception):
@@ -100,6 +103,14 @@ class ProvenanceStore:
                     old_status TEXT NOT NULL, new_status TEXT NOT NULL,
                     note TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS claim_votes(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+                    note TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(claim_id,reviewer_id)
+                );
                 CREATE TABLE IF NOT EXISTS object_versions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     object_id INTEGER NOT NULL REFERENCES objects(id),
@@ -123,6 +134,7 @@ class ProvenanceStore:
                 [
                     ("staff", "藏品研究员", "staff"),
                     ("reviewer1", "返还审查员", "reviewer"),
+                    ("reviewer2", "返还审查员乙", "reviewer"),
                     ("claimant1", "权利主张人", "claimant"),
                     ("public", "公众访客", "public"),
                 ],
@@ -291,6 +303,13 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                if new_status in DUAL_REVIEW_TARGETS:
+                    votes = conn.execute("SELECT reviewer_id,decision FROM claim_votes WHERE claim_id=?", (claim_id,)).fetchall()
+                    approvers = {v["reviewer_id"] for v in votes if v["decision"] == "approve"}
+                    if any(v["decision"] == "reject" for v in votes):
+                        raise BusinessError("存在反对票，分歧已记录，主张继续停在待复核", 409, "review_disagreement")
+                    if len(approvers) < REQUIRED_APPROVALS:
+                        raise BusinessError("需两名不同审查员都赞成后才能进入协商或返还结论", 409, "dual_review_required")
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
                     "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
@@ -306,6 +325,57 @@ class ProvenanceStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    def cast_vote(self, user_id, claim_id, decision, note):
+        if decision not in {"approve", "reject"}:
+            raise BusinessError("decision 必须是 approve 或 reject", 422, "invalid_decision")
+        if len(note.strip()) < 5:
+            raise BusinessError("审查意见至少 5 字", 422, "review_note_required")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+                if not claim:
+                    raise BusinessError("权利主张不存在", 404, "not_found")
+                if claim["claimant_id"] == user_id:
+                    raise BusinessError("审查员不能给自己的主张投票", 403, "self_review_forbidden")
+                if claim["status"] != "under_review":
+                    raise BusinessError("只有待复核阶段的主张可以登记审查意见", 409, "invalid_stage")
+                try:
+                    conn.execute(
+                        "INSERT INTO claim_votes(claim_id,reviewer_id,decision,note,created_at) VALUES(?,?,?,?,?)",
+                        (claim_id, user_id, decision, note.strip(), now()),
+                    )
+                except sqlite3.IntegrityError:
+                    raise BusinessError("该审查员已登记过审查意见", 409, "duplicate_vote")
+                self._audit(conn, claim["object_id"], user_id, "claim.vote", {"claim_id": claim_id, "decision": decision})
+                return {"claim_id": claim_id, "reviewer_id": user_id, "decision": decision}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def claim_review_status(self, user_id, claim_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+            if not claim:
+                raise BusinessError("权利主张不存在", 404, "not_found")
+            votes = [dict(v) for v in conn.execute(
+                "SELECT reviewer_id,decision,note,created_at FROM claim_votes WHERE claim_id=? ORDER BY id", (claim_id,)).fetchall()]
+            reviewers = [r["id"] for r in conn.execute("SELECT id FROM users WHERE role='reviewer' ORDER BY id").fetchall()]
+            approve_count = sum(1 for v in votes if v["decision"] == "approve")
+            reject_count = len(votes) - approve_count
+            voted = {v["reviewer_id"] for v in votes}
+            return {
+                "claim_id": claim_id, "object_id": claim["object_id"], "status": claim["status"],
+                "required_approvals": REQUIRED_APPROVALS,
+                "approve_count": approve_count, "reject_count": reject_count,
+                "pending_approvals": max(0, REQUIRED_APPROVALS - approve_count),
+                "awaiting_reviewers": [r for r in reviewers if r not in voted],
+                "ready": approve_count >= REQUIRED_APPROVALS and reject_count == 0,
+                "votes": votes,
+            }
 
     def get_object(self, user_id, object_id):
         with self.connect() as conn:
@@ -331,17 +401,19 @@ class ProvenanceStore:
                 "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
                                      "evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (x["id"],)).fetchall()]}
                             for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
-                "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
+                "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()],
+                                      "votes": [dict(v) for v in conn.execute("SELECT reviewer_id,decision,note,created_at FROM claim_votes WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
                            for c in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
             }
             if user["role"] == "claimant":
-                # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料。
+                # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料与审查投票。
                 result["events"] = [e for e in result["events"] if e["visibility"] == "public"]
                 result["unlinked_evidence"] = []
                 result["claims"] = [c for c in result["claims"] if c["claimant_id"] == user_id]
                 for c in result["claims"]:
                     c.pop("claimant_id", None)
+                    c.pop("votes", None)
             return result
 
     def list_objects(self, user_id):
@@ -426,6 +498,10 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
             d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "vote" and method == "POST":
+            d = self._body(); return self._send(201, store.cast_vote(user, int(parts[2]), d.get("decision", ""), d.get("note", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "review" and method == "GET":
+            return self._send(200, store.claim_review_status(user, int(parts[2])))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):
