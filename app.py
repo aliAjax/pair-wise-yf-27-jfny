@@ -22,6 +22,16 @@ CLAIM_TRANSITIONS = {
     "resolved_return": set(),
     "rejected": set(),
 }
+# 只有“受理立案”允许一名审查员单独完成；进入协商或结案必须两名审查员一致赞成。
+TRIAGE_TARGET = "under_review"
+REVIEW_VOTABLE = {"under_review", "negotiating"}
+REVIEW_QUORUM = 2
+STATUS_LABELS = {
+    "under_review": "待复核",
+    "negotiating": "进入协商",
+    "resolved_return": "返还结论",
+    "rejected": "驳回主张",
+}
 
 
 class BusinessError(Exception):
@@ -100,6 +110,24 @@ class ProvenanceStore:
                     old_status TEXT NOT NULL, new_status TEXT NOT NULL,
                     note TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS claim_review_rounds(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    round INTEGER NOT NULL,
+                    opened_status TEXT NOT NULL,
+                    decided_at TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK(outcome IN ('unanimous','split')),
+                    UNIQUE(claim_id,round)
+                );
+                CREATE TABLE IF NOT EXISTS claim_review_votes(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    round INTEGER NOT NULL,
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    vote TEXT NOT NULL CHECK(vote IN ('negotiating','resolved_return','rejected')),
+                    note TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(claim_id,round,reviewer_id)
+                );
                 CREATE TABLE IF NOT EXISTS object_versions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     object_id INTEGER NOT NULL REFERENCES objects(id),
@@ -114,6 +142,9 @@ class ProvenanceStore:
                 );
                 """
             )
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(claims)").fetchall()}
+            if "review_round" not in cols:
+                conn.execute("ALTER TABLE claims ADD COLUMN review_round INTEGER NOT NULL DEFAULT 1")
 
     def seed(self):
         self.init_schema()
@@ -122,7 +153,8 @@ class ProvenanceStore:
                 "INSERT OR IGNORE INTO users(id,name,role) VALUES(?,?,?)",
                 [
                     ("staff", "藏品研究员", "staff"),
-                    ("reviewer1", "返还审查员", "reviewer"),
+                    ("reviewer1", "返还审查员甲", "reviewer"),
+                    ("reviewer2", "返还审查员乙", "reviewer"),
                     ("claimant1", "权利主张人", "claimant"),
                     ("public", "公众访客", "public"),
                 ],
@@ -291,12 +323,15 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                if new_status != TRIAGE_TARGET:
+                    raise BusinessError("进入协商或结案必须经两名审查员复核投票", 403, "dual_review_required")
+                if claim["claimant_id"] == user_id:
+                    raise BusinessError("审查员不能给自己的主张投票", 403, "cannot_review_own_claim")
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
                     "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
                     (claim_id, user_id, claim["status"], new_status, note.strip(), now()),
                 )
-                new_version = claim["object_id"]
                 obj = self._object(conn, claim["object_id"])
                 next_version = obj["version"] + 1
                 conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (next_version, now(), claim["object_id"]))
@@ -306,6 +341,187 @@ class ProvenanceStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    def _reviewers(self, conn):
+        return conn.execute("SELECT id,name FROM users WHERE role='reviewer' ORDER BY id").fetchall()
+
+    def _review_summary(self, conn, claim):
+        """组装复核轮次、票数与待补票信息，仅 staff/reviewer 可见。"""
+        rounds_rows = conn.execute(
+            "SELECT * FROM claim_review_rounds WHERE claim_id=? ORDER BY round", (claim["id"],)
+        ).fetchall()
+        decided_rounds = {r["round"]: dict(r) for r in rounds_rows}
+        votes = conn.execute(
+            "SELECT * FROM claim_review_votes WHERE claim_id=? ORDER BY round,id", (claim["id"],)
+        ).fetchall()
+        reviewers = self._reviewers(conn)
+        rounds: dict[int, dict] = {}
+        for v in votes:
+            rnd = rounds.setdefault(v["round"], {"round": v["round"], "votes": [], "outcome": None, "decided_at": None})
+            rnd["votes"].append({
+                "reviewer_id": v["reviewer_id"],
+                "vote": v["vote"],
+                "vote_label": STATUS_LABELS.get(v["vote"], v["vote"]),
+                "note": v["note"],
+                "created_at": v["created_at"],
+            })
+        for num, info in decided_rounds.items():
+            rnd = rounds.setdefault(num, {"round": num, "votes": [], "outcome": None, "decided_at": None})
+            rnd["outcome"] = info["outcome"]
+            rnd["decided_at"] = info["decided_at"]
+        open_round = None
+        if claim["status"] in REVIEW_VOTABLE:
+            open_round = max(claim["review_round"], max(rounds.keys(), default=0))
+        round_list = [rounds[k] for k in sorted(rounds.keys())]
+        open_info = None
+        pending = []
+        if open_round is not None:
+            open_votes = rounds.get(open_round, {"round": open_round, "votes": [], "outcome": None})["votes"]
+            voted_ids = {v["reviewer_id"] for v in open_votes}
+            pending = [{"reviewer_id": r["id"], "name": r["name"]} for r in reviewers if r["id"] not in voted_ids]
+            counts = {}
+            for v in open_votes:
+                counts[v["vote"]] = counts.get(v["vote"], 0) + 1
+            open_info = {
+                "round": open_round,
+                "votes": open_votes,
+                "counts": counts,
+                "pending_votes": pending,
+                "pending_count": len(pending),
+                "can_decide": len(pending) == 0,
+            }
+        final = None
+        if claim["status"] in {"resolved_return", "rejected"} and round_list:
+            last = round_list[-1]
+            final = {"round": last["round"], "outcome": last["outcome"], "decided_at": last["decided_at"], "votes": last["votes"]}
+        return {
+            "rounds": round_list,
+            "open_round": open_info,
+            "final_decision": final,
+        }
+
+    def cast_review(self, user_id, claim_id, vote, note):
+        if vote not in {"negotiating", "resolved_return", "rejected"}:
+            raise BusinessError("vote 必须是 negotiating、resolved_return 或 rejected", 422, "invalid_vote")
+        if len(note.strip()) < 5:
+            raise BusinessError("审查意见至少 5 字", 422, "review_note_required")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+                if not claim:
+                    raise BusinessError("权利主张不存在", 404, "not_found")
+                if claim["status"] not in REVIEW_VOTABLE:
+                    raise BusinessError(f"主张当前处于 {claim['status']}，不能投票", 409, "not_votable")
+                if claim["claimant_id"] == user_id:
+                    raise BusinessError("审查员不能给自己的主张投票", 403, "cannot_review_own_claim")
+                allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
+                if vote not in allowed:
+                    raise BusinessError(f"{STATUS_LABELS.get(claim['status'], claim['status'])}阶段不能给出“{STATUS_LABELS.get(vote, vote)}”意见", 422, "vote_not_allowed")
+                round_no = claim["review_round"]
+                already = conn.execute(
+                    "SELECT 1 FROM claim_review_votes WHERE claim_id=? AND round=? AND reviewer_id=?",
+                    (claim_id, round_no, user_id),
+                ).fetchone()
+                if already:
+                    raise BusinessError("你在本轮已登记审查意见，不能重复投票", 409, "already_voted")
+                conn.execute(
+                    "INSERT INTO claim_review_votes(claim_id,round,reviewer_id,vote,note,created_at) VALUES(?,?,?,?,?,?)",
+                    (claim_id, round_no, user_id, vote, note.strip(), now()),
+                )
+                votes = conn.execute(
+                    "SELECT * FROM claim_review_votes WHERE claim_id=? AND round=? ORDER BY id",
+                    (claim_id, round_no),
+                ).fetchall()
+                reviewer_count = len(self._reviewers(conn))
+                pending_count = max(reviewer_count - len(votes), 0)
+                distinct_votes = {v["vote"] for v in votes}
+                agreed = len(votes) >= REVIEW_QUORUM and len(distinct_votes) == 1
+                split = len(votes) >= REVIEW_QUORUM and len(distinct_votes) > 1
+                if not agreed and not split:
+                    self._audit(conn, claim["object_id"], user_id, "claim.review_vote", {
+                        "claim_id": claim_id, "round": round_no, "vote": vote, "waiting_for": pending_count,
+                    })
+                    conn.commit()
+                    return {
+                        "claim_id": claim_id, "round": round_no, "status": claim["status"],
+                        "result": "waiting", "vote": vote, "pending_count": pending_count,
+                    }
+                outcome = "unanimous" if agreed else "split"
+                conn.execute(
+                    "INSERT INTO claim_review_rounds(claim_id,round,opened_status,decided_at,outcome) VALUES(?,?,?,?,?)",
+                    (claim_id, round_no, claim["status"], now(), outcome),
+                )
+                if split:
+                    next_round = round_no + 1
+                    conn.execute(
+                        "UPDATE claims SET review_round=?,updated_at=? WHERE id=?",
+                        (next_round, now(), claim_id),
+                    )
+                    self._audit(conn, claim["object_id"], user_id, "claim.review_split", {
+                        "claim_id": claim_id, "round": round_no, "next_round": next_round,
+                        "votes": [{"reviewer_id": v["reviewer_id"], "vote": v["vote"]} for v in votes],
+                    })
+                    conn.commit()
+                    return {
+                        "claim_id": claim_id, "round": round_no, "next_round": next_round,
+                        "status": claim["status"], "result": "split", "pending_count": reviewer_count,
+                    }
+                new_status = votes[0]["vote"]
+                names = "、".join(f"{v['reviewer_id']}投{STATUS_LABELS[new_status]}" for v in votes)
+                conn.execute(
+                    "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
+                    (claim_id, user_id, claim["status"], new_status, f"两名审查员一致赞成（{names}）", now()),
+                )
+                next_round = round_no + 1
+                conn.execute(
+                    "UPDATE claims SET status=?,review_round=?,updated_at=? WHERE id=?",
+                    (new_status, next_round, now(), claim_id),
+                )
+                obj = self._object(conn, claim["object_id"])
+                next_version = obj["version"] + 1
+                conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (next_version, now(), claim["object_id"]))
+                self._snapshot(conn, claim["object_id"], user_id)
+                self._audit(conn, claim["object_id"], user_id, "claim.review_unanimous", {
+                    "claim_id": claim_id, "round": round_no,
+                    "from": claim["status"], "to": new_status,
+                    "votes": [{"reviewer_id": v["reviewer_id"], "vote": v["vote"]} for v in votes],
+                })
+                conn.commit()
+                return {
+                    "claim_id": claim_id, "round": round_no,
+                    "old_status": claim["status"], "status": new_status,
+                    "result": "unanimous", "object_version": next_version,
+                }
+            except Exception:
+                conn.rollback()
+                raise
+
+    def review_board(self, user_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            reviewers = self._reviewers(conn)
+            reviewer_ids = [r["id"] for r in reviewers]
+            items = []
+            for claim in conn.execute("SELECT * FROM claims WHERE status IN ('under_review','negotiating') ORDER BY id").fetchall():
+                votes = conn.execute(
+                    "SELECT * FROM claim_review_votes WHERE claim_id=? AND round=?",
+                    (claim["id"], claim["review_round"]),
+                ).fetchall()
+                voted = {v["reviewer_id"] for v in votes}
+                items.append({
+                    "claim_id": claim["id"],
+                    "object_id": claim["object_id"],
+                    "status": claim["status"],
+                    "round": claim["review_round"],
+                    "vote_count": len(votes),
+                    "counts": [{"vote": v, "label": STATUS_LABELS[v]} for v in sorted({x["vote"] for x in votes})],
+                    "voted_by": [v["reviewer_id"] for v in votes],
+                    "pending_votes": [rid for rid in reviewer_ids if rid not in voted],
+                    "can_viewer_vote": user_id in reviewer_ids and user_id not in voted and claim["claimant_id"] != user_id,
+                })
+            return {"items": items, "reviewers": [{"id": r["id"], "name": r["name"]} for r in reviewers]}
 
     def get_object(self, user_id, object_id):
         with self.connect() as conn:
@@ -331,17 +547,24 @@ class ProvenanceStore:
                 "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
                                      "evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (x["id"],)).fetchall()]}
                             for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
-                "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
+                "claims": [{**dict(c), "reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()],
+                            **self._review_summary(conn, c)}
                            for c in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
             }
             if user["role"] == "claimant":
-                # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料。
+                # 主张人只看到公开来源事件和自己主张的阶段状态，不能浏览内部审查与复核意见。
                 result["events"] = [e for e in result["events"] if e["visibility"] == "public"]
                 result["unlinked_evidence"] = []
                 result["claims"] = [c for c in result["claims"] if c["claimant_id"] == user_id]
                 for c in result["claims"]:
                     c.pop("claimant_id", None)
+                    c.pop("reviews", None)
+                    c.pop("rounds", None)
+                    c.pop("open_round", None)
+                    c.pop("final_decision", None)
+                    c.pop("transitions", None)
+                    c.pop("review_round", None)
             return result
 
     def list_objects(self, user_id):
@@ -426,6 +649,10 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
             d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
+        if parts == ["api", "reviews"] and method == "GET":
+            return self._send(200, store.review_board(user))
+        if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "reviews" and method == "POST":
+            d = self._body(); return self._send(201, store.cast_review(user, int(parts[2]), d.get("vote", ""), d.get("note", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):

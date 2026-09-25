@@ -1,4 +1,180 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>藏品来源与返还审查</h1><div class="panel"><select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select><button onclick="load()">查看当前角色可见藏品</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch("/api/objects",{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>藏品来源与返还审查</title>
+<style>
+body{font:15px system-ui;max-width:1040px;margin:24px auto;padding:0 16px;color:#222}
+select,button,input,textarea{padding:7px;margin:3px;font:inherit}
+button{cursor:pointer;border:1px solid #88a;border-radius:5px;background:#eef}
+button.danger{background:#fdd;border-color:#c88}
+pre{background:#f5f5f5;padding:12px;white-space:pre-wrap;border-radius:6px;font-size:13px}
+.panel{border:1px solid #bbb;padding:14px;border-radius:8px;margin:12px 0}
+.panel h2{margin:0 0 10px;font-size:17px}
+.hidden{display:none}
+table{border-collapse:collapse;width:100%}
+td,th{border:1px solid #ccc;padding:5px 8px;text-align:left;font-size:13px}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#e8e8f8;margin-right:6px;font-size:12px}
+.tag.split{background:#fbe0c0}.tag.unanimous{background:#d8f0d8}
+.muted{color:#777;font-size:12px}
+label{display:block;margin:6px 0 2px;font-size:13px;color:#444}
+</style>
+</head>
+<body>
+<h1>藏品来源与返还审查</h1>
+
+<div class="panel">
+  当前身份：
+  <select id="user" onchange="onRole()">
+    <option value="staff">staff 藏品研究员</option>
+    <option value="reviewer1">reviewer1 返还审查员甲</option>
+    <option value="reviewer2">reviewer2 返还审查员乙</option>
+    <option value="claimant1">claimant1 权利主张人</option>
+    <option value="public">public 公众访客</option>
+  </select>
+  <button onclick="loadObjects()">查看当前角色可见藏品</button>
+  <span class="muted">复核票、分歧记录与待补票仅工作人员和审查员可见。</span>
+</div>
+
+<div class="panel hidden" id="staffPanel">
+  <h2>工作人员入口</h2>
+  <button onclick="loadBoard()">查看待复核看板（票数 / 待补票）</button>
+</div>
+
+<div class="panel hidden" id="reviewPanel">
+  <h2>双人复核入口</h2>
+  <div id="boardArea"></div>
+  <hr>
+  <label>主张 ID</label><input id="rvClaim" size="6">
+  <label>操作</label>
+  <select id="rvAction">
+    <option value="triage">受理立案（submitted → 待复核，单人即可）</option>
+    <option value="negotiating">投票：进入协商</option>
+    <option value="resolved_return">投票：返还结论</option>
+    <option value="rejected">投票：驳回主张</option>
+  </select>
+  <label>审查意见（至少 5 字，每人每轮只能登记一次）</label>
+  <textarea id="rvNote" rows="2" cols="70"></textarea><br>
+  <button onclick="submitReview()">提交审查动作</button>
+  <p class="muted">两名审查员意见一致才会进入协商或下结论；意见相左则保留分歧记录并开启新一轮，主张继续停在待复核。不能给自己的主张投票。</p>
+</div>
+
+<div class="panel">
+  <h2>藏品与主张</h2>
+  <label>藏品 ID</label><input id="objId" size="6" placeholder="留空列出全部">
+  <button onclick="loadObjects()">列表</button>
+  <button onclick="loadObject()">查看藏品详情</button>
+  <div id="claimArea"></div>
+</div>
+
+<div class="panel hidden" id="claimPanel">
+  <h2>提交权利主张（主张人）</h2>
+  <label>藏品 ID</label><input id="clObj" size="6">
+  <label>主张人/群体</label><input id="clBy" size="24">
+  <label>期望结果</label><input id="clWant" size="40">
+  <button onclick="submitClaim()">提交主张</button>
+</div>
+
+<pre id="out">就绪。</pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const headers = extra => Object.assign({"X-User-Id": $("user").value, "Content-Type": "application/json"}, extra || {});
+function show(json){ $("out").textContent = JSON.stringify(json, null, 2); }
+async function api(url, opts){
+  const r = await fetch(url, opts);
+  show(await r.json());
+  return r;
+}
+function onRole(){
+  const role = $("user").value;
+  $("staffPanel").classList.toggle("hidden", role !== "staff");
+  $("reviewPanel").classList.toggle("hidden", role !== "reviewer1" && role !== "reviewer2");
+  $("claimPanel").classList.toggle("hidden", role !== "claimant1");
+  $("boardArea").innerHTML = "";
+  loadObjects();
+}
+async function loadObjects(){
+  const r = await fetch("/api/objects", {headers: headers()});
+  show(await r.json());
+}
+async function loadObject(){
+  const id = $("objId").value.trim();
+  if(!id) return loadObjects();
+  const r = await fetch("/api/objects/" + id, {headers: headers()});
+  const data = await r.json();
+  show(data);
+  renderClaims(data);
+}
+function esc(s){ return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function renderClaims(data){
+  if(!data || !Array.isArray(data.claims)){ $("claimArea").innerHTML = ""; return; }
+  const role = $("user").value;
+  const internal = role === "staff" || role === "reviewer1" || role === "reviewer2";
+  let html = "<table><tr><th>主张ID</th><th>主张人</th><th>期望</th><th>阶段</th>" + (internal ? "<th>复核票与最终意见</th>" : "") + "</tr>";
+  for(const c of data.claims){
+    html += `<tr><td>${c.id}</td><td>${esc(c.claimed_by)}</td><td>${esc(c.desired_outcome)}</td><td>${esc(c.status)}</td>`;
+    if(internal){
+      let cell = "";
+      if(c.open_round){
+        const o = c.open_round;
+        const counts = Object.entries(o.counts).map(([k,v]) => `${esc(k)}×${v}`).join("，") || "暂无票";
+        cell += `<span class="tag">第${o.round}轮：${counts}</span>`;
+        cell += `<span class="tag">待补票 ${o.pending_count}：${o.pending_votes.map(p=>esc(p.reviewer_id)).join("、")||"无"}</span>`;
+        cell += o.votes.map(v => `<div class="muted">${esc(v.reviewer_id)} → ${esc(v.vote_label)}：${esc(v.note)}</div>`).join("");
+      }
+      for(const rd of (c.rounds||[])){
+        const cls = rd.outcome === "split" ? "split" : "unanimous";
+        cell += `<div><span class="tag ${cls}">第${rd.round}轮 ${rd.outcome === "split" ? "存在分歧，保留记录" : "一致赞成"}</span></div>`;
+        cell += rd.votes.map(v => `<div class="muted">${esc(v.reviewer_id)} → ${esc(v.vote_label)}：${esc(v.note)}</div>`).join("");
+      }
+      if(c.final_decision){
+        cell += `<div class="tag unanimous">最终意见：${esc(c.status)}（第${c.final_decision.round}轮一致）</div>`;
+      }
+      html += `<td>${cell || '<span class="muted">尚未复核</span>'}</td>`;
+    }
+    html += "</tr>";
+  }
+  html += "</table>";
+  $("claimArea").innerHTML = html;
+}
+async function submitReview(){
+  const id = $("rvClaim").value.trim();
+  const action = $("rvAction").value;
+  const note = $("rvNote").value;
+  if(!id) return alert("请填写主张 ID");
+  if(action === "triage"){
+    await api(`/api/claims/${id}/transition`, {method:"POST", headers:headers(), body:JSON.stringify({status:"under_review", note})});
+  }else{
+    await api(`/api/claims/${id}/reviews`, {method:"POST", headers:headers(), body:JSON.stringify({vote:action, note})});
+  }
+  loadBoard();
+}
+async function loadBoard(){
+  const r = await fetch("/api/reviews", {headers: headers()});
+  const data = await r.json();
+  if(!r.ok){ show(data); return; }
+  let html = "<table><tr><th>主张ID</th><th>藏品</th><th>阶段</th><th>轮次</th><th>已投票</th><th>待补票</th><th>操作</th></tr>";
+  if(!data.items.length) html += `<tr><td colspan="7" class="muted">当前没有待复核主张。</td></tr>`;
+  for(const it of data.items){
+    const votes = it.counts.map(c => `${esc(c.label)}`).join("、");
+    html += `<tr><td>${it.claim_id}</td><td>${it.object_id}</td><td>${esc(it.status)}</td><td>第${it.round}轮</td>
+      <td>${it.vote_count} 票${votes ? "（"+votes+"）" : ""}<div class="muted">${esc(it.voted_by.join("、"))}</div></td>
+      <td>${esc(it.pending_votes.join("、")) || "无"}</td>
+      <td><button onclick="$('rvClaim').value=${it.claim_id}">填入投票表单</button></td></tr>`;
+  }
+  html += "</table>";
+  $("boardArea").innerHTML = html;
+  show(data);
+}
+async function submitClaim(){
+  await api(`/api/objects/${$("clObj").value.trim()}/claims`, {
+    method:"POST", headers:headers(),
+    body: JSON.stringify({claimed_by: $("clBy").value, desired_outcome: $("clWant").value})
+  });
+}
+onRole();
+</script>
+</body>
+</html>
